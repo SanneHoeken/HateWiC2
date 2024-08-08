@@ -1,19 +1,29 @@
 import pandas as pd
 import numpy as np
-import torch
-from os import path
-from tensordict import TensorDict 
+import torch, json
 from torchmetrics.functional import pairwise_cosine_similarity
 from datasets import Dataset
 from sentence_transformers import SentenceTransformer, losses
 from sentence_transformers.trainer import SentenceTransformerTrainer, SentenceTransformerTrainingArguments
 
-#os.environ['PYTORCH_ENABLE_MPS_FALLBACK'] = '1'
-#os.environ['COMMANDLINE_ARGS'] = '--no-half'
-
-def sample_triples(data_ids, X, y, topk=10):
+def get_id2embeddings(id2data, model_path):
     
-    # works for binary label set {0, 1}
+    sentences = [id2data[data_id]['sentence'] for data_id in id2data]
+    data_ids = list(id2data.keys())
+    model = SentenceTransformer(model_path).cpu() # if device is mps, because that doesn't work
+    embeddings = model.encode(sentences, convert_to_tensor=True, show_progress_bar=True)
+    
+    return {data_id: emb for data_id, emb in zip(data_ids, embeddings)}
+
+
+def sample_triples(data_ids, id2embeddings, id2data, topk=10):
+    
+    # get X and y data (in aligned order)
+    X = [id2embeddings[data_id] for data_id in data_ids]
+    y = [id2data[data_id]['label'] for data_id in data_ids]
+    assert set(y) == {0, 1}
+
+    # store embeddings of positive and negative examples and their ids
     pos_vecs, neg_vecs, pos_data_ids, neg_data_ids = [], [], [], []
     for i, y in enumerate(y):
         if y == 1:
@@ -23,30 +33,35 @@ def sample_triples(data_ids, X, y, topk=10):
             neg_vecs.append(X[i])
             neg_data_ids.append(data_ids[i])
     
-    sample_size = min([topk, len(pos_vecs), len(neg_vecs)])
-    print('Number of positive examples (= anchor examples):', len(pos_vecs))
-    print('Number of negative examples:', len(neg_vecs))
-    print('Number of sampled positive & negative examples per anchor example:', sample_size)
-
+    # compute pairwise cosine similarity matrix between positive and negative embeddings
     posneg_pairwise_sim = pairwise_cosine_similarity(torch.stack(pos_vecs), torch.stack(neg_vecs))
     posid2sortednegids = {pos_data_ids[p_id]: [neg_data_ids[x] for x in np.argsort(posneg_pairwise_sim[p_id])] for p_id in range(len(pos_vecs))}
 
+    # compute pairwise cosine similarity matrix between positive embeddings
     pospos_pairwise_sim = pairwise_cosine_similarity(torch.stack(pos_vecs), torch.stack(pos_vecs))
     posid2sortedposids = {pos_data_ids[p_id]: [pos_data_ids[x] for x in np.argsort(pospos_pairwise_sim[p_id])] for p_id in range(len(pos_vecs))}
 
+    # collect a set of triples for every positive embedding as anchor embedding
+    sample_size = min([topk, len(pos_vecs), len(neg_vecs)])
     triples = []
     for anchor_id in pos_data_ids:
+        # triple positive: top k positive embeddings that are most similar to anchor embedding
         for i in range(sample_size):
             pos_id = posid2sortedposids[anchor_id][-(i+1)]
             if anchor_id != pos_id:
                 for j in range(sample_size):
+                    # triple negative: top k negative embeddings that are most similar to anchor embedding
                     neg_id = posid2sortednegids[anchor_id][-(j+1)]
                     triples.append((anchor_id, pos_id, neg_id))
-                    # alternative: neg_id = posid2sortedposids[anchor_id][i]
 
+                    # triple negative 2: top k positive embeddings that are LEAST similar to anchor embedding
+                    neg_id2 = posid2sortedposids[anchor_id][i]
+                    triples.append((anchor_id, pos_id, neg_id2))
+
+    sentence_triples = [[id2data[id1]['sentence'], id2data[id2]['sentence'], id2data[id3]['sentence']] for (id1, id2, id3) in triples]
     print('Resulting number of triples:', len(triples))
 
-    return triples
+    return sentence_triples
 
 
 def train_contrastive_model(train_data, model_dir, pretrained_model_name, batch_size=16, epochs=3, triplet_margin=1):
@@ -57,54 +72,37 @@ def train_contrastive_model(train_data, model_dir, pretrained_model_name, batch_
     args = SentenceTransformerTrainingArguments(output_dir=model_dir, per_device_train_batch_size=batch_size, num_train_epochs=epochs)
     trainer = SentenceTransformerTrainer(model=model, args=args, train_dataset=train_dataset, loss=train_loss) #evaluator=evaluator
     trainer.train()
-    model.save_pretrained(model_dir+"final")
+    model.save_pretrained(model_dir)
 
 
-def create_id2embeddings(id2sentences, model_path, output_path):
+def main(input_path, split2ids_path, sentence_column, id_column, label_column, 
+         pretrained_model_name, embedding_path, model_path):
     
-    sentences = list(id2sentences.values())
-    data_ids = list(id2sentences.keys())
-    model = SentenceTransformer(model_path).cpu() # if device is mps, because that doesn't work
-    embeddings = model.encode(sentences, convert_to_tensor=True, show_progress_bar=True)
-    id2embeddings = {data_id: emb for data_id, emb in zip(data_ids, embeddings)}
-    torch.save(TensorDict(id2embeddings, batch_size=embeddings[0].shape), output_path) 
-
-
-def main(input_path, sentence_column, id_column, label_column, pretrained_model_name, embedding_path, model_path):
-    
-    # load dataset
+    # load data
+    with open(split2ids_path, 'r') as infile:
+        split2ids = json.load(infile)
+    train_ids = split2ids['train']
     data = pd.read_csv(input_path)
-    data[id_column] = data[id_column].astype(str)
-    id2sentences = {data_id: sent.lower() for data_id, sent in zip(data[id_column], data[sentence_column])}
-
-    # get sentence embeddings
-    if not path.exists(embedding_path):
-        create_id2embeddings(id2sentences, pretrained_model_name, embedding_path)
-    id2embeddings = torch.load(embedding_path)
+    id2data = {str(row[id_column]): {'sentence': row[sentence_column].lower(), 
+                                     'label': row[label_column]} for i, row in data.iterrows()}
     
-    data = data[data[id_column].isin(id2embeddings.keys())].dropna(subset=[label_column]) 
-    data = data.drop(data[data[label_column] == "None"].index)
-
     # sample training triples
-    data_ids = list(data[id_column])
-    X = [id2embeddings[data_id] for data_id in data_ids]
-    y = data[label_column]
-    id_triples = sample_triples(data_ids, X, y)
-    sentence_triples = [[id2sentences[id1], id2sentences[id2], id2sentences[id3]] for (id1, id2, id3) in id_triples]
-
+    id2embeddings = get_id2embeddings(id2data, pretrained_model_name)
+    sentence_triples = sample_triples(train_ids, id2embeddings, id2data, topk=10)
+    
     # train model
     train_contrastive_model(sentence_triples, model_path, pretrained_model_name)
-
+    
  
 if __name__ == '__main__':
 
     pretrained_model_name = 'sentence-transformers/all-mpnet-base-v2'
-    input_path = '../data/cohasen_data/cohasen_annotated_plus_T5gendefs.csv' #majority
+    input_path = '../data/WiC-majority-withT5gendefs.csv' 
+    split2ids_path = '../data/train70dev10test20-ids.json'
     id_column = 'id'
     label_column = 'majority_annotation'
     sentence_column = 'generated_definition'
-    embedding_path = '../output/cohasen/embeddings/majority/allmpnetbasev2-generated_definitions'
-    model_path = '../output/cohasen/models/contrastive1/'
-
-    main(input_path, sentence_column, id_column, label_column, pretrained_model_name, embedding_path, model_path)
+    model_path = '../output/models/contrastive70extraneg/'
+    
+    main(input_path, split2ids_path, sentence_column, id_column, label_column, pretrained_model_name, model_path)
     
