@@ -50,26 +50,25 @@ def define(in_prompts, lm, cur_tokenizer, targets, maxl=256, bsize=4, filter_tar
 
 if __name__ == "__main__":
 
-    model_name = 'ltg/flan-t5-definition-en-base'
-    data_files = ['PEJOR1_annotated_adjusted.csv', 'PEJOR2_annotated_adjusted.csv']
+    model_name = 'ltg/flan-t5-definition-en-xl' # or base, large or xl
+    data_file = 'HateWiC_IndividualAnnos.csv'
+    test_df = pd.read_csv(data_file, sep=';')
     
-    for data_file in data_files:
 
-        tokenizer = AutoTokenizer.from_pretrained(model_name, add_prefix_space=True)
-        if torch.cuda.is_available():
-            model = AutoModelForSeq2SeqLM.from_pretrained(model_name, device_map="auto")
-        else:
-            model = AutoModelForSeq2SeqLM.from_pretrained(model_name, low_cpu_mem_usage=True)
+    tokenizer = AutoTokenizer.from_pretrained(model_name, add_prefix_space=True)
+    if torch.cuda.is_available():
+        model = AutoModelForSeq2SeqLM.from_pretrained(model_name, device_map="auto")
+    else:
+        model = AutoModelForSeq2SeqLM.from_pretrained(model_name, low_cpu_mem_usage=True)
 
-        test_df = pd.read_csv(data_file)
+    task_prefix = "What is the definition of <TRG>?"
+    input_sentences = []
+    for target, context in zip(test_df['term'], test_df['example']):
+        prompt = " ".join([context, task_prefix.replace("<TRG>", target)])
+        input_sentences.append(prompt)
 
-        task_prefix = "What is the definition of <TRG>?"
-        input_sentences = []
-        for target, context in zip(test_df['term'], test_df['example']):
-            prompt = " ".join([context, task_prefix.replace("<TRG>", target)])
-            input_sentences.append(prompt)
-
-        targets = test_df['term'].tolist()
-        answers = define(input_sentences, model, tokenizer, targets, filter_target=1) # all default values from Giulianelli et al. (2023)
-        test_df["generated_definition"] = answers
-        test_df.to_csv(data_file.replace('.csv', '_T5gendefs.csv') , index=False) 
+    targets = test_df['term'].tolist()
+    answers = define(input_sentences, model, tokenizer, targets, filter_target=1) # all default values from Giulianelli et al. (2023)
+    
+    test_df["t5xl_definition"] = answers
+    test_df.to_csv(data_file.replace('.csv', '_GenDefs.csv'), index=False) 
